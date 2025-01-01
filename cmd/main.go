@@ -19,5 +19,5 @@ func main() {
 	}
 
 	clientset, metricsClient := initClients(config)
-	startScalingLoop(clientset, metricsClient)
+	startScalingLoop(clientset, metricsClient, nil) // TODO: pass config file
 }

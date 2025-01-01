@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
+	"gopkg.in/yaml.v2"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +28,36 @@ const (
 	taskInterval                   = 5 * time.Minute
 )
 
+// DeploymentConfig holds the configuration for each deployment
+type DeploymentConfig struct {
+	Namespace   string `yaml:"namespace"`
+	AppLabel    string `yaml:"appLabel"`
+	Priority    int    `yaml:"priority"`
+	MaxCpuUsage int    `yaml:"maxCpuUsage"`
+}
+
+// Config holds the deployment configurations
+type Config struct {
+	Deployments []DeploymentConfig `yaml:"deployments"`
+}
+
+func loadConfig(filePath string) (*Config, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var config Config
+	decoder := yaml.NewDecoder(file)
+	err = decoder.Decode(&config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
 func initClients(config *rest.Config) (*kubernetes.Clientset, *versioned.Clientset) {
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
@@ -40,26 +72,30 @@ func initClients(config *rest.Config) (*kubernetes.Clientset, *versioned.Clients
 	return clientset, metricsClient
 }
 
-func startScalingLoop(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) {
+func startScalingLoop(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset, config *Config) {
 
 	for {
-		releasedReplicas := unscaleDeployments(clientset, metricsClient)
 
-		// if releasedReplicas == 0 then there is no point in rescaling deployments
-		if releasedReplicas != 0 {
-			time.Sleep(retryInterval) // TODO: what for
-			rescaleDeployments(releasedReplicas, clientset)
+		for _, deploymentConfig := range config.Deployments {
+			releasedReplicas := unscaleDeployments(clientset, metricsClient, deploymentConfig)
+
+			// if releasedReplicas == 0 then there is no point in rescaling deployments
+			if releasedReplicas != 0 {
+				time.Sleep(retryInterval) // TODO: what for
+				rescaleDeployments(releasedReplicas, clientset, deploymentConfig)
+			}
+
+			scaleDeployments(clientset, metricsClient, deploymentConfig) // deploymentConfig
 		}
 
-		scaleDeployments(clientset, metricsClient)
 		time.Sleep(taskInterval) // TODO: gocron
 	}
 }
 
 // unscaleDeployments ...
-func unscaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) int32 {
+func unscaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset, deploymentConfig DeploymentConfig) int32 {
 	releasedReplicas := int32(0)
-	deployments := listDeployments(clientset)
+	deployments := listDeployments(clientset, deploymentConfig)
 
 	for _, deployment := range deployments {
 
@@ -91,8 +127,8 @@ func unscaleDeployments(clientset *kubernetes.Clientset, metricsClient *versione
 }
 
 // rescaleDeployments ...
-func rescaleDeployments(releasedReplicas int32, clientset *kubernetes.Clientset) error {
-	deployments := listDeployments(clientset)
+func rescaleDeployments(releasedReplicas int32, clientset *kubernetes.Clientset, deploymentConfig DeploymentConfig) error {
+	deployments := listDeployments(clientset, deploymentConfig)
 	updatedReplicaFactor := recalculateReplicasValueUnscaled(releasedReplicas, deployments)
 
 	if updatedReplicaFactor > 0 {
@@ -108,14 +144,14 @@ func rescaleDeployments(releasedReplicas int32, clientset *kubernetes.Clientset)
 }
 
 // scaleDeployments ..
-func scaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) {
+func scaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.Clientset, deploymentConfig DeploymentConfig) {
 	//unscaledDeployments, scaledDeployments, scaledReplicasCounter := categorizeDeployments(listDeployments(clientset))
 	deploymentsToScale := []v1.Deployment{}
 	scaledDeployments := []v1.Deployment{} // TODO: rename
 	var scaledReplicasCounter int32
 	//unscaledDeployments := []v1.Deployment{}
 
-	deployments := listDeployments(clientset)
+	deployments := listDeployments(clientset, deploymentConfig)
 
 	for _, deployment := range deployments {
 		switch isMoreThanSingleDeployment(deployment) {
@@ -123,7 +159,7 @@ func scaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.
 			labelSelector := labels.Set(deployment.Spec.Selector.MatchLabels).AsSelector()
 
 			// list pods with the same labels as the deployment
-			pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{
+			pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{ // inject
 				LabelSelector: labelSelector.String(),
 			})
 
@@ -170,9 +206,9 @@ func scaleDeployments(clientset *kubernetes.Clientset, metricsClient *versioned.
 	}
 }
 
-func listDeployments(clientset *kubernetes.Clientset) []v1.Deployment {
-	deploymentsList, err := clientset.AppsV1().Deployments("default").List(context.TODO(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", appLabel),
+func listDeployments(clientset *kubernetes.Clientset, deploymentConfig DeploymentConfig) []v1.Deployment {
+	deploymentsList, err := clientset.AppsV1().Deployments(deploymentConfig.Namespace).List(context.TODO(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", deploymentConfig.AppLabel),
 	})
 	if err != nil {
 		log.Fatalf("Error listing deployments: %s", err)
@@ -193,7 +229,8 @@ func updateDeploymentReplicasValue(deployment v1.Deployment, newReplicasValue in
 	var err error
 
 	for attempt := 0; attempt < retryLimit; attempt++ {
-		_, err = clientset.AppsV1().Deployments("default").Update(context.TODO(), &deployment, metav1.UpdateOptions{})
+
+		_, err = clientset.AppsV1().Deployments(deployment.Namespace).Update(context.TODO(), &deployment, metav1.UpdateOptions{})
 		if err == nil {
 			break
 		}
@@ -240,6 +277,7 @@ func calculateReplicasValue(deploymentsToScale []v1.Deployment, scaledReplicasCo
 	}
 
 	log.Printf("replicasValue is calculated by dividing used replicas between already scaled deployments")
+	// TODO: fix uneffective way
 	return float32(scaledReplicasCounter) / float32(len(deploymentsToScale)) // TODO: (len(scaledDeployments) + len(deploymentsToScale)))
 }
 
@@ -267,7 +305,7 @@ func calculatePodCpuUsage(pod *corev1.Pod, metricsClient *versioned.Clientset) (
 // calculateDeploymentCpuUsage calculates the CPU usage for a specific deployment.
 func calculateDeploymentCpuUsage(labelSelector labels.Selector, clientset *kubernetes.Clientset, metricsClient *versioned.Clientset) (int64, error) {
 	// List pods with the same labels as the deployment
-	pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{
+	pods, err := clientset.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{ // inject
 		LabelSelector: labelSelector.String(),
 	})
 	if err != nil {
